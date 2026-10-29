@@ -1,27 +1,22 @@
 """Repository for archival settings and archive table operations."""
 
-import time
-import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, text
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, literal_column, text
 
 from app.database import DbSession
 from app.models import DataPointSeriesArchive, DataSource, SeriesSample
 from app.models.archival_setting import ArchivalSetting
 from app.models.series_type_definition import SeriesTypeDefinition
+from app.repositories.local_day import OFFSET_REACH, every_series_type_sql, sample_day_sql, utc_midnight
 from app.repositories.repositories import timeline_key_column, utc_bucket_start
 from app.schemas.enums import (
-    AGGREGATION_METHOD_BY_TYPE,
-    AggregationMethod,
     ProviderName,
     SeriesType,
     TimelineBucket,
     TimelineGroupBy,
-    get_series_type_from_id,
     get_series_type_id,
 )
 
@@ -37,24 +32,51 @@ class ArchivalSettingRepository:
         """Return the current archival settings (singleton row with id=1)."""
         return db.query(ArchivalSetting).filter(ArchivalSetting.id == 1).one()
 
-    def update(self, db: DbSession, archive_after_days: int | None, delete_after_days: int | None) -> ArchivalSetting:
-        """Update archival settings."""
+    def update(self, db: DbSession, rollup_enabled: bool, delete_after_days: int | None) -> ArchivalSetting:
+        """Update the data lifecycle settings."""
         setting = self.get(db)
-        setting.archive_after_days = archive_after_days
+        setting.rollup_enabled = rollup_enabled
         setting.delete_after_days = delete_after_days
         db.commit()
         db.refresh(setting)
         return setting
+
+    def mark_deleted_before(self, db: DbSession, day: date) -> None:
+        """Record that samples of local days before ``day`` are gone; the mark never moves back, as a longer
+        retention window does not bring deleted samples back."""
+        setting = self.get(db)
+        setting.deleted_before = max(setting.deleted_before or day, day)
+        db.commit()
 
 
 # ---------------------------------------------------------------------------
 # Data-point archive repository
 # ---------------------------------------------------------------------------
 
-ARCHIVE_BATCH_SIZE = 5_000
 # Safety limits to prevent overloading the DB on initial runs
-MAX_ROWS_PER_RUN = 500_000  # Stop after archiving this many rows per invocation
+MAX_ROWS_PER_RUN = 500_000  # Stop after deleting this many rows per invocation
 MAX_SECONDS_PER_RUN = 120  # Stop after this many seconds per invocation
+
+# Sources holding a sample before the bound, in id order after a cursor: one index probe per source.
+_SOURCES_WITH_SAMPLES_BEFORE = text(f"""
+    SELECT ds.id FROM data_source ds
+    WHERE ds.id > :after
+        AND EXISTS (
+            SELECT 1 FROM series_sample s
+            WHERE s.data_source_id = ds.id AND {every_series_type_sql("s")} AND s.recorded_at < :before
+        )
+    ORDER BY ds.id LIMIT :limit
+""")
+
+# A source's earliest sample: one index probe per series type, not a scan of its history.
+_EARLIEST_SAMPLE = text("""
+    SELECT min(first.recorded_at) FROM series_type_definition t
+    CROSS JOIN LATERAL (
+        SELECT s.recorded_at FROM series_sample s
+        WHERE s.data_source_id = :source_id AND s.series_type_definition_id = t.id
+        ORDER BY s.recorded_at LIMIT 1
+    ) first
+""")
 
 
 class BatchedRun(NamedTuple):
@@ -146,204 +168,29 @@ class DataPointSeriesArchiveRepository:
             "total_pretty": _pretty_bytes(total),
         }
 
-    def archive_data_before(self, db: DbSession, cutoff_date: date) -> BatchedRun:
-        """Aggregate live rows older than *cutoff_date* into the archive table.
+    def sources_with_samples_before(self, db: DbSession, before: datetime, after: UUID, limit: int) -> list[UUID]:
+        """Up to ``limit`` data sources, in id order after ``after``, holding a sample recorded before ``before``."""
+        params = {"before": before, "after": after, "limit": limit}
+        return list(db.execute(_SOURCES_WITH_SAMPLES_BEFORE, params).scalars())
 
-        For each (data_source_id, series_type_definition_id, date):
-        1. Compute the aggregate value using the type's AggregationMethod (sum/avg/max).
-        2. UPSERT into archive table (on conflict → update with re-calculated value).
-        3. DELETE original live rows.
+    def earliest_sample(self, db: DbSession, source_id: UUID) -> datetime | None:
+        return db.execute(_EARLIEST_SAMPLE, {"source_id": source_id}).scalar()
 
-        Safety: stops after MAX_ROWS_PER_RUN rows or MAX_SECONDS_PER_RUN seconds
-        to avoid overwhelming the server on the first run. The next Celery
-        invocation will continue where this one left off.
-
-        Returns the number of live rows removed, and whether none older are left.
-        """
-        total_deleted = 0
-        start_time = time.monotonic()
-
-        # Process in batches to avoid excessive memory usage
-        while True:
-            # Safety check: stop if we've processed enough or taken too long
-            elapsed = time.monotonic() - start_time
-            if total_deleted >= MAX_ROWS_PER_RUN:
-                break
-            if elapsed >= MAX_SECONDS_PER_RUN:
-                break
-
-            # Step 1: Find data_source_ids with archivable data (batch by source)
-            source_ids = (
-                db.query(SeriesSample.data_source_id)
-                .filter(cast(SeriesSample.recorded_at, Date) < cutoff_date)
-                .distinct()
-                .limit(10)
-                .all()
-            )
-
-            if not source_ids:
-                return BatchedRun(total_deleted, complete=True)
-
-            source_id_list = [s[0] for s in source_ids]
-
-            # Step 2: Group by (source, type, date) and compute all aggregates
-            # We'll post-process to select the correct one per type
-            raw_aggregates = (
-                db.query(
-                    SeriesSample.data_source_id,
-                    SeriesSample.series_type_definition_id,
-                    cast(SeriesSample.recorded_at, Date).label("date"),
-                    func.avg(SeriesSample.value).label("avg_value"),
-                    func.min(SeriesSample.value).label("min_value"),
-                    func.max(SeriesSample.value).label("max_value"),
-                    func.sum(SeriesSample.value).label("sum_value"),
-                    # Prefer-daily split for SUM series: a daily total must not be added to
-                    # its own intraday samples. NULL is_daily_total counts as a sample.
-                    func.sum(case((SeriesSample.is_daily_total.is_(True), SeriesSample.value))).label(
-                        "daily_sum_value"
-                    ),
-                    func.sum(case((SeriesSample.is_daily_total.isnot(True), SeriesSample.value))).label(
-                        "sample_sum_value"
-                    ),
-                    func.count(SeriesSample.id).label("sample_count"),
-                )
-                .filter(
-                    SeriesSample.data_source_id.in_(source_id_list),
-                    cast(SeriesSample.recorded_at, Date) < cutoff_date,
-                )
-                .group_by(
-                    SeriesSample.data_source_id,
-                    SeriesSample.series_type_definition_id,
-                    cast(SeriesSample.recorded_at, Date),
-                )
-                .all()
-            )
-
-            if not raw_aggregates:
-                return BatchedRun(total_deleted, complete=True)
-
-            # Step 3: For each group, pick the correct aggregate column based on series type
-            values_list = []
-            for row in raw_aggregates:
-                try:
-                    series_type = get_series_type_from_id(row.series_type_definition_id)
-                    method = AGGREGATION_METHOD_BY_TYPE.get(series_type, AggregationMethod.AVG)
-
-                    if method == AggregationMethod.SUM:
-                        # Prefer the daily total when present, else sum the samples
-                        # (mirrors get_daily_activity_aggregates — no daily+intraday double-count).
-                        value = row.daily_sum_value if row.daily_sum_value is not None else row.sample_sum_value
-                    elif method == AggregationMethod.MAX:
-                        value = row.max_value
-                    else:  # AVG
-                        value = row.avg_value
-
-                    values_list.append(
-                        {
-                            "id": _deterministic_uuid(row.data_source_id, row.series_type_definition_id, row.date),
-                            "data_source_id": row.data_source_id,
-                            "series_type_definition_id": row.series_type_definition_id,
-                            "bucket_start_at": datetime.combine(row.date, datetime.min.time(), tzinfo=timezone.utc),
-                            "aggregation_type": method.value,
-                            "value": value,
-                            "sample_count": row.sample_count,
-                        }
-                    )
-                except KeyError:
-                    # Unknown series type ID — skip this aggregate but don't
-                    # delete the corresponding live rows either.
-                    continue
-
-            if not values_list:
-                # All series types in this batch were unknown — skip without
-                # deleting to avoid data loss.
-                continue
-
-            # Step 4: Upsert into archive
-            for i in range(0, len(values_list), ARCHIVE_BATCH_SIZE):
-                chunk = values_list[i : i + ARCHIVE_BATCH_SIZE]
-                stmt = insert(DataPointSeriesArchive).values(chunk)
-                stmt = stmt.on_conflict_do_update(
-                    constraint="uq_archive_source_type_start_agg",
-                    set_={
-                        "value": stmt.excluded.value,
-                        "sample_count": stmt.excluded.sample_count,
-                    },
-                )
-                db.execute(stmt)
-
-            # Step 5: Delete the live rows we just archived
-            deleted_count = (
-                db.query(SeriesSample)
-                .filter(
-                    SeriesSample.data_source_id.in_(source_id_list),
-                    cast(SeriesSample.recorded_at, Date) < cutoff_date,
-                )
-                .delete(synchronize_session=False)
-            )
-            total_deleted += deleted_count
-
-            db.commit()
-
-        return BatchedRun(total_deleted, complete=False)
-
-    def delete_archive_before(self, db: DbSession, cutoff_date: date) -> int:
-        """Permanently delete archive rows older than *cutoff_date*.
-
-        Returns the number of rows deleted.
-        """
-        deleted = (
-            db.query(DataPointSeriesArchive)
+    def delete_days(self, db: DbSession, source_id: UUID, days: list[date]) -> int:
+        """Delete the source's samples of these consecutive local days, whole; returns the rows deleted."""
+        local_day = literal_column(sample_day_sql())
+        return (
+            db.query(SeriesSample)
             .filter(
-                DataPointSeriesArchive.bucket_start_at
-                < datetime.combine(cutoff_date, datetime.min.time(), tzinfo=timezone.utc)
+                SeriesSample.data_source_id == source_id,
+                text(every_series_type_sql()),
+                # The UTC reach of the days, so the index bounds the scan; the local day picks within it.
+                SeriesSample.recorded_at >= utc_midnight(days[0]) - OFFSET_REACH,
+                SeriesSample.recorded_at < utc_midnight(days[-1]) + timedelta(days=1) + OFFSET_REACH,
+                local_day.in_(days),
             )
             .delete(synchronize_session=False)
         )
-        db.commit()
-        return deleted
-
-    def delete_live_before(self, db: DbSession, cutoff_date: date) -> BatchedRun:
-        """Permanently delete live rows older than *cutoff_date*.
-
-        Used when retention policy is active without archival — data is
-        simply discarded instead of being aggregated first.
-
-        Uses a subquery + DELETE pattern because PostgreSQL does not support
-        ``DELETE ... LIMIT`` and SQLAlchemy's ``Query.delete()`` rejects
-        queries with ``.limit()``.
-
-        Respects the same safety limits as archive_data_before.
-
-        Returns the number of live rows deleted, and whether none older are left.
-        """
-        total_deleted = 0
-        start_time = time.monotonic()
-
-        while True:
-            elapsed = time.monotonic() - start_time
-            if total_deleted >= MAX_ROWS_PER_RUN or elapsed >= MAX_SECONDS_PER_RUN:
-                break
-
-            ids_to_delete = (
-                db.query(SeriesSample.id)
-                .filter(cast(SeriesSample.recorded_at, Date) < cutoff_date)
-                .limit(ARCHIVE_BATCH_SIZE)
-                .subquery()
-            )
-            deleted = (
-                db.query(SeriesSample)
-                .filter(SeriesSample.id.in_(ids_to_delete))  # ty:ignore[invalid-argument-type]
-                .delete(synchronize_session=False)
-            )
-
-            if deleted == 0:
-                return BatchedRun(total_deleted, complete=True)
-
-            total_deleted += deleted
-            db.commit()
-
-        return BatchedRun(total_deleted, complete=False)
 
     def get_user_counts_by_provider_and_type_from_archive(
         self,
@@ -612,10 +459,3 @@ def _pretty_bytes(n: int) -> str:
             return f"{n:.2f} {unit}" if unit != "B" else f"{n} B"
         n /= 1024  # ty:ignore[invalid-assignment]
     return f"{n:.2f} PB"
-
-
-def _deterministic_uuid(data_source_id: UUID, series_type_id: int, d: date) -> UUID:
-    """Generate a deterministic UUID v5 for an archive row so upserts are idempotent."""
-    namespace = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-    name = f"{data_source_id}:{series_type_id}:{d.isoformat()}"
-    return uuid.uuid5(namespace, name)
