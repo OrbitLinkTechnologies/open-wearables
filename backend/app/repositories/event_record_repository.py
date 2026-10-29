@@ -1,4 +1,5 @@
 import contextlib
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -97,6 +98,41 @@ class EventRecordRepository(
                 self.model.end_datetime == creation.end_datetime,
             )
             .one_or_none()
+        )
+
+    def get_by_external_ids(
+        self, db_session: DbSession, user_id: UUID, external_ids: Iterable[str], provider: str | None = None
+    ) -> dict[str, EventRecord]:
+        """The user's records carrying these provider ids, in one query, by external id."""
+        ids = list({external_id for external_id in external_ids if external_id})
+        if not ids:
+            return {}
+        query = (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id, self.model.external_id.in_(ids))
+        )
+        if provider is not None:
+            query = query.filter(DataSource.provider == provider)
+        return {record.external_id: record for record in query if record.external_id}
+
+    def main_sleep_ended_before(
+        self, db_session: DbSession, user_id: UUID, at: datetime, within: timedelta, provider: str
+    ) -> EventRecord | None:
+        """The user's latest main sleep from this provider that ended at most ``within`` before ``at``."""
+        return (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                self.model.category == EventCategory.SLEEP,
+                _nap_condition(False),
+                self.model.end_datetime <= at,
+                self.model.end_datetime > at - within,
+            )
+            .order_by(self.model.end_datetime.desc())
+            .first()
         )
 
     def get_by_external_id(
