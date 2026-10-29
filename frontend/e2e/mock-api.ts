@@ -96,8 +96,11 @@ let EMAIL_ENABLED = true;
 let WEBHOOKS_ENABLED = true;
 /** Lets a test see what an instance with nothing rolled up yet looks like on the dashboard. */
 let EMPTY_AGGREGATES = false;
-/** What the default password earns at sign-in: `required` as in production. */
-let PASSWORD_CHANGE: 'required' | 'recommended' = 'required';
+/** What the default password earns at sign-in: a token with `required`/`recommended`, or a refusal. */
+let PASSWORD_CHANGE: 'required' | 'recommended' | 'refused' = 'required';
+
+const DEFAULT_PASSWORD_REFUSED =
+	"Signing in with the default password is disabled in production. Set the ADMIN_EMAIL and ADMIN_PASSWORD environment variables on the backend (backend/config/.env or your hosting provider's settings) to this account's email and a new password, then restart the backend.";
 
 const PORT = Number(process.env.MOCK_API_PORT ?? 8787);
 
@@ -164,6 +167,11 @@ const server = Bun.serve({
 			return new Response(null, { status: 204 });
 		}
 
+		if (pathname === '/__refuse-default-password') {
+			PASSWORD_CHANGE = 'refused';
+			return new Response(null, { status: 204 });
+		}
+
 		if (pathname === '/__webhooks-off') {
 			WEBHOOKS_ENABLED = false;
 			return new Response(null, { status: 204 });
@@ -186,6 +194,10 @@ const server = Bun.serve({
 		if (pathname === '/api/v1/auth/login') {
 			const form = await request.formData();
 			const password = form.get('password');
+			// Like the API: refused before the account lookup, so any email gets the same answer.
+			if (password === DEFAULT_PASSWORD && PASSWORD_CHANGE === 'refused') {
+				return json({ detail: DEFAULT_PASSWORD_REFUSED }, 403);
+			}
 			if (form.get('username') !== CREDENTIALS.email) {
 				return json({ detail: 'Incorrect email or password' }, 401);
 			}
