@@ -16121,7 +16121,7 @@
           "resting_heart_rate",
           "heart_rate_variability_sdnn",
           "heart_rate_recovery_one_minute",
-          "walking_heart_rate_average",
+          "walking_heart_rate",
           "heart_rate_variability_rmssd",
           "oxygen_saturation",
           "blood_glucose",
@@ -16159,7 +16159,6 @@
           "exercise_time",
           "physical_effort",
           "flights_climbed",
-          "average_met",
           "active_time",
           "total_energy",
           "distance_walking_running",
@@ -19848,6 +19847,18 @@
               }
             ],
             "title": "Max Watts"
+          },
+          "average_met": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Average Met",
+            "description": "The workout's average metabolic equivalent (MET), from its physical_effort series."
           },
           "moving_time_seconds": {
             "anyOf": [

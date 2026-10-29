@@ -215,7 +215,7 @@ Fired per ingestion batch — one event per distinct `(user, provider, series_ty
 
 | Event | Series types included |
 |-------|-----------------------|
-| `heart_rate.created` | `heart_rate`, `resting_heart_rate`, `walking_heart_rate_average`, `atrial_fibrillation_burden` |
+| `heart_rate.created` | `heart_rate`, `resting_heart_rate`, `walking_heart_rate`, `atrial_fibrillation_burden` |
 | `heart_rate_variability.created` | `heart_rate_variability_sdnn`, `heart_rate_variability_rmssd` |
 | `steps.created` | `steps` |
 | `calories.created` | `active_energy`, `basal_energy`, `total_energy` |
@@ -232,6 +232,19 @@ Fired per ingestion batch — one event per distinct `(user, provider, series_ty
 | `workout_metrics.created` | `cadence`, `power`, `speed`, running/walking/swimming metrics |
 | `environmental.created` | `environmental_audio_exposure`, `uv_exposure`, `weather_temperature`, … |
 | `timeseries.created` | Catch-all for series types not yet explicitly mapped. |
+
+Each series type also has its own event, `series.<series_type>.created`, carrying only that series' samples.
+
+<Note>
+Two series changed in this release, and their events with them:
+
+| Before | Now |
+|--------|-----|
+| `series.walking_heart_rate_average.created` | `series.walking_heart_rate.created` |
+| `series.average_met.created` | retired: a workout's average MET is its `physical_effort` average, returned as the workout's `average_met` |
+
+Self-hosting with endpoints that filter on the old names: run `scripts/data_migrations/rename_series_webhook_events.py --phase=add` from the new image before it takes traffic, so those endpoints also subscribe to the new names, and `--phase=remove` once the deploy is done. An endpoint whose filter names only old events is left as it is, as removing them would leave it with no filter and every event: the script lists it, and its filter needs the new names set by hand.
+</Note>
 
 ---
 
