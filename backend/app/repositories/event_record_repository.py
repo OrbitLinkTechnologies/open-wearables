@@ -1,6 +1,6 @@
 import contextlib
 from collections.abc import Iterable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 
@@ -18,11 +18,9 @@ from sqlalchemy import (
     delete,
     desc,
     func,
-    lateral,
     literal_column,
     select,
     text,
-    true,
     tuple_,
 )
 from sqlalchemy.dialects.postgresql import insert
@@ -31,9 +29,10 @@ from sqlalchemy.orm import Query, selectinload
 
 from app.database import DbSession
 from app.integrations.rollup_queue import mark_dirty_days
-from app.models import DataSource, EventRecord, SeriesSample, SleepDetails, WorkoutDetails
+from app.models import DataSource, EventRecord, EventRecordAggregate, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSourceIdentity, DataSourceRepository
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+from app.repositories.local_day import utc_midnight
 from app.repositories.repositories import (
     CrudRepository,
     source_filter_conditions,
@@ -41,7 +40,15 @@ from app.repositories.repositories import (
     utc_bucket_start,
 )
 from app.schemas.data_type_coverage import CoverageSpan
-from app.schemas.enums import DeviceType, EventCategory, ProviderName, SeriesType, TimelineBucket, get_series_type_id
+from app.schemas.enums import (
+    ComputedBy,
+    DeviceType,
+    EventCategory,
+    ProviderName,
+    SeriesType,
+    TimelineBucket,
+    get_series_type_id,
+)
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordQueryParams,
@@ -57,6 +64,44 @@ def _nap_condition(is_nap: bool) -> ColumnElement[bool]:
     """Match sleep records by nap flag; a missing detail row or NULL flag counts as main sleep."""
     flagged_nap = EventRecord.sleep_detail.has(SleepDetails.is_nap.is_(True))
     return flagged_nap if is_nap else ~flagged_nap
+
+
+# What the user's other devices recorded inside a sleep, for the series the sleep's own device has no value of:
+# a sleep logged by an app while a watch measured the night.
+# Only the (sleep, series) pairs the sleep lacks: the sleep's own device's readings inside it (rolled up within
+# 15 minutes, until then only samples), else the user's other devices'. Scalar subqueries, so the second is read
+# only where the first is empty, each one index range: joined plainly, the planner hashes the whole sample table.
+_NIGHT_FROM_SAMPLES = text("""
+    SELECT m.record_id, m.type_id, coalesce(
+        (SELECT avg(s.value) FROM series_sample s
+         WHERE s.data_source_id = er.data_source_id AND s.series_type_definition_id = m.type_id
+            AND s.recorded_at >= er.start_datetime AND s.recorded_at <= er.end_datetime
+            AND s.is_daily_total IS NOT TRUE),
+        -- A day value the provider sent at an instant inside the sleep (Oura's SpO2 at 00:00 UTC): a sample before
+        -- the aggregate tables, it counted in this average.
+        (SELECT avg(coalesce(a.avg, a.last)) FROM series_aggregate a
+         WHERE a.data_source_id = er.data_source_id AND a.series_type_definition_id = m.type_id
+            AND a.period_kind = 'day' AND a.computed_by = 'provider'
+            AND a.period_start >= er.start_datetime AND a.period_start <= er.end_datetime),
+        (SELECT avg(s.value) FROM data_source other
+         JOIN series_sample s ON s.data_source_id = other.id AND s.series_type_definition_id = m.type_id
+            AND s.recorded_at >= er.start_datetime AND s.recorded_at <= er.end_datetime
+            AND s.is_daily_total IS NOT TRUE
+         WHERE other.user_id = own.user_id AND other.id <> own.id)
+    ) AS avg
+    FROM unnest(CAST(:record_ids AS uuid[]), CAST(:type_ids AS integer[])) AS m(record_id, type_id)
+    JOIN event_record er ON er.id = m.record_id
+    JOIN data_source own ON own.id = er.data_source_id
+""")
+
+# A night's physiology in a sleep summary, by the key its row carries.
+_SLEEP_PHYSIOLOGY = {
+    "avg_hr": SeriesType.heart_rate,
+    "avg_hrv_sdnn": SeriesType.heart_rate_variability_sdnn,
+    "avg_hrv_rmssd": SeriesType.heart_rate_variability_rmssd,
+    "avg_resp": SeriesType.respiratory_rate,
+    "avg_spo2": SeriesType.oxygen_saturation,
+}
 
 
 class EventRecordRepository(
@@ -918,39 +963,6 @@ class EventRecordRepository(
             )
         ).subquery()
 
-        hr_id = get_series_type_id(SeriesType.heart_rate)
-        sdnn_id = get_series_type_id(SeriesType.heart_rate_variability_sdnn)
-        rmssd_id = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
-        resp_id = get_series_type_id(SeriesType.respiratory_rate)
-        spo2_id = get_series_type_id(SeriesType.oxygen_saturation)
-
-        # Lateral subquery: for each sleep row, average physio data within
-        # [min_start_time, max_end_time) — exact window, no date-grouping mismatch.
-        physio_lateral = lateral(
-            select(
-                func.avg(case((SeriesSample.series_type_definition_id == hr_id, SeriesSample.value))).label("avg_hr"),
-                func.avg(case((SeriesSample.series_type_definition_id == sdnn_id, SeriesSample.value))).label(
-                    "avg_hrv_sdnn"
-                ),
-                func.avg(case((SeriesSample.series_type_definition_id == rmssd_id, SeriesSample.value))).label(
-                    "avg_hrv_rmssd"
-                ),
-                func.avg(case((SeriesSample.series_type_definition_id == resp_id, SeriesSample.value))).label(
-                    "avg_resp"
-                ),
-                func.avg(case((SeriesSample.series_type_definition_id == spo2_id, SeriesSample.value))).label(
-                    "avg_spo2"
-                ),
-            )
-            .join(DataSource, SeriesSample.data_source_id == DataSource.id)
-            .where(
-                DataSource.user_id == user_id,
-                SeriesSample.series_type_definition_id.in_([hr_id, sdnn_id, rmssd_id, resp_id, spo2_id]),
-                SeriesSample.recorded_at >= subquery.c.min_start_time,
-                SeriesSample.recorded_at < subquery.c.max_end_time,
-            )
-        )
-
         # Build main query from subquery, casting record_id back to UUID
         record_id_col = cast(subquery.c.record_id_text, SQL_UUID).label("record_id")
         query = db_session.query(
@@ -972,12 +984,7 @@ class EventRecordRepository(
             subquery.c.efficiency_duration_sum,
             subquery.c.nap_count,
             subquery.c.nap_duration,
-            physio_lateral.c.avg_hr,
-            physio_lateral.c.avg_hrv_sdnn,
-            physio_lateral.c.avg_hrv_rmssd,
-            physio_lateral.c.avg_resp,
-            physio_lateral.c.avg_spo2,
-        ).outerjoin(physio_lateral, true())
+        )
         query = query.filter(subquery.c.source_rank == 1)
 
         # Handle cursor pagination
@@ -1030,18 +1037,17 @@ class EventRecordRepository(
                     # Nap tracking
                     "nap_count": int(row.nap_count) if row.nap_count is not None else None,
                     "nap_duration_minutes": int(row.nap_duration) // 60 if row.nap_duration is not None else None,
-                    # Physio averages from series_sample
-                    "avg_hr": float(row.avg_hr) if row.avg_hr is not None else None,
-                    "avg_hrv_sdnn": float(row.avg_hrv_sdnn) if row.avg_hrv_sdnn is not None else None,
-                    "avg_hrv_rmssd": float(row.avg_hrv_rmssd) if row.avg_hrv_rmssd is not None else None,
-                    "avg_resp": float(row.avg_resp) if row.avg_resp is not None else None,
-                    "avg_spo2": float(row.avg_spo2) if row.avg_spo2 is not None else None,
                 }
             )
 
         # Attach per-session breakdown (individual sleep/nap records) for each summary,
         # keyed by the same (date, provider, source, device_model) grouping identity.
-        sessions_by_key = self._get_sleep_sessions(db_session, user_id, start_date, end_date)
+        sessions_by_key, main_sleeps_by_key = self._get_sleep_sessions(db_session, user_id, start_date, end_date)
+        # Only this page's nights are read from the aggregate table, not every night in the range.
+        page_keys = {(s["sleep_date"], s["provider"], s["source"], s["device_model"]) for s in summaries}
+        physiology = self._sleep_physiology(
+            db_session, {key: sleeps for key, sleeps in main_sleeps_by_key.items() if key in page_keys}
+        )
         for summary in summaries:
             key = (
                 summary["sleep_date"],
@@ -1050,6 +1056,7 @@ class EventRecordRepository(
                 summary["device_model"],
             )
             summary["sessions"] = sessions_by_key.get(key, [])
+            summary.update(physiology.get(key, dict.fromkeys(_SLEEP_PHYSIOLOGY)))
 
         return summaries
 
@@ -1059,8 +1066,9 @@ class EventRecordRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
-    ) -> dict[tuple, list[dict]]:
-        """Get individual sleep/nap sessions keyed by (sleep_date, provider, source, device_model).
+    ) -> tuple[dict[tuple, list[dict]], dict[tuple, list[tuple[UUID, int]]]]:
+        """Get individual sleep/nap sessions keyed by (sleep_date, provider, source, device_model),
+        and per key the main sleeps' record ids with their durations.
 
         Mirrors the date filter and grouping identity of ``get_sleep_summaries`` but returns one
         entry per underlying EventRecord instead of collapsing them. Per-session duration prefers
@@ -1084,6 +1092,7 @@ class EventRecordRepository(
         rows = (
             db_session.query(
                 local_sleep_date.label("sleep_date"),
+                EventRecord.id.label("record_id"),
                 EventRecord.start_datetime.label("start_time"),
                 EventRecord.end_datetime.label("end_time"),
                 EventRecord.zone_offset.label("zone_offset"),
@@ -1107,8 +1116,11 @@ class EventRecordRepository(
         )
 
         sessions_by_key: dict[tuple, list[dict]] = {}
+        main_sleeps_by_key: dict[tuple, list[tuple[UUID, int]]] = {}
         for row in rows:
             key = (row.sleep_date, row.provider, row.source, row.device_model)
+            if not row.is_nap:
+                main_sleeps_by_key.setdefault(key, []).append((row.record_id, int(row.duration_seconds or 0)))
             sessions_by_key.setdefault(key, []).append(
                 {
                     "start_time": row.start_time,
@@ -1118,7 +1130,112 @@ class EventRecordRepository(
                     "is_nap": bool(row.is_nap),
                 }
             )
-        return sessions_by_key
+        return sessions_by_key, main_sleeps_by_key
+
+    @staticmethod
+    def sleep_values_by_day(
+        db_session: DbSession, user_id: UUID, type_id: int, start_dt: datetime, end_dt: datetime
+    ) -> dict[date, float]:
+        """A series' value on each of the user's main sleeps that overlap [start_dt, end_dt), by the UTC date
+        the sleep ended: the provider's row where it sent one, else ours rolled up from the sleep's samples."""
+        rows = (
+            db_session.query(EventRecord.end_datetime, EventRecordAggregate.avg)
+            .join(EventRecordAggregate, EventRecordAggregate.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                EventRecord.category == EventCategory.SLEEP,
+                _nap_condition(False),
+                EventRecord.end_datetime >= start_dt,
+                EventRecord.start_datetime < end_dt,
+                EventRecordAggregate.series_type_definition_id == type_id,
+                EventRecordAggregate.avg.isnot(None),
+            )
+            # Ours first, so a provider's row for the same date overwrites it whichever sleep ended later.
+            .order_by(EventRecordAggregate.computed_by == ComputedBy.PROVIDER, EventRecord.end_datetime)
+        )
+        return {end.astimezone(timezone.utc).date(): float(avg) for end, avg in rows if avg is not None}
+
+    @staticmethod
+    def night_values(
+        db_session: DbSession, user_id: UUID, type_ids: list[int], first_day: date, last_day: date
+    ) -> dict[tuple[UUID, int, date], float]:
+        """Each main sleep's value of these series, keyed by its source, series and the local day it ended on
+        (the morning it scores): the provider's where it sent one, else ours."""
+        local_end = cast(
+            func.timezone("UTC", EventRecord.end_datetime)
+            + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+            Date,
+        )
+        rows = (
+            db_session.query(
+                EventRecord.data_source_id,
+                EventRecordAggregate.series_type_definition_id,
+                local_end,
+                EventRecordAggregate.avg,
+            )
+            .join(EventRecordAggregate, EventRecordAggregate.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                EventRecord.category == EventCategory.SLEEP,
+                _nap_condition(False),
+                # A day either side of the range in UTC, so an offset cannot push a night out; the local day decides.
+                EventRecord.end_datetime >= utc_midnight(first_day) - timedelta(days=1),
+                EventRecord.end_datetime < utc_midnight(last_day) + timedelta(days=2),
+                local_end >= first_day,
+                local_end <= last_day,
+                EventRecordAggregate.series_type_definition_id.in_(type_ids),
+                EventRecordAggregate.avg.isnot(None),
+            )
+            # Ours first, so the provider's row for the same night overwrites it.
+            .order_by(EventRecordAggregate.computed_by == ComputedBy.PROVIDER, EventRecord.end_datetime)
+        )
+        return {(source_id, type_id, day): float(avg) for source_id, type_id, day, avg in rows if avg is not None}
+
+    @staticmethod
+    def _sleep_physiology(
+        db_session: DbSession, main_sleeps_by_key: dict[tuple, list[tuple[UUID, int]]]
+    ) -> dict[tuple, dict[str, float | None]]:
+        """Each night's averages from its own main sleeps' aggregates, the provider's before ours, else the samples
+        recorded inside the sleep (its own device's, else the user's other devices'); weighted by sleep length."""
+        record_ids = [record_id for sleeps in main_sleeps_by_key.values() for record_id, _ in sleeps]
+        type_ids = {get_series_type_id(series_type): key for key, series_type in _SLEEP_PHYSIOLOGY.items()}
+        averages: dict[tuple[UUID, int], float] = {}
+        if record_ids:
+            rows = (
+                db_session.query(EventRecordAggregate)
+                .filter(
+                    EventRecordAggregate.record_id.in_(record_ids),
+                    EventRecordAggregate.series_type_definition_id.in_(type_ids),
+                )
+                # Ours first, so the provider's row for the same sleep overwrites it.
+                .order_by(EventRecordAggregate.computed_by == ComputedBy.PROVIDER)
+            )
+            for row in rows:
+                if row.avg is not None:
+                    averages[(row.record_id, row.series_type_definition_id)] = float(row.avg)
+        missing = {(record_id, type_id) for record_id in record_ids for type_id in type_ids} - set(averages)
+        if missing:
+            pairs = sorted(missing)
+            params = {"record_ids": [r for r, _ in pairs], "type_ids": [t for _, t in pairs]}
+            for row in db_session.execute(_NIGHT_FROM_SAMPLES, params):
+                if row.avg is not None:
+                    averages[(row.record_id, row.type_id)] = float(row.avg)
+
+        physiology: dict[tuple, dict[str, float | None]] = {}
+        for key, sleeps in main_sleeps_by_key.items():
+            night: dict[str, float | None] = {}
+            for type_id, field in type_ids.items():
+                weighted = [
+                    (averages[(record_id, type_id)], max(duration, 1))
+                    for record_id, duration in sleeps
+                    if (record_id, type_id) in averages
+                ]
+                total = sum(weight for _, weight in weighted)
+                night[field] = sum(value * weight for value, weight in weighted) / total if weighted else None
+            physiology[key] = night
+        return physiology
 
     def get_daily_workout_aggregates(
         self,

@@ -11601,7 +11601,7 @@
           "rollup_enabled": {
             "type": "boolean",
             "title": "Rollup Enabled",
-            "description": "Roll changed days of samples up into daily and per-session aggregates every night.",
+            "description": "Roll changed days of samples up into daily and per-session aggregates every 15 minutes. Off, the days that change are dropped: activity and body summaries count them from the samples, day reads of sources without provider day values get no new days.",
             "default": false
           },
           "delete_after_days": {
@@ -12329,15 +12329,20 @@
           "archived": {
             "type": "integer",
             "title": "Archived"
+          },
+          "aggregated": {
+            "type": "integer",
+            "title": "Aggregated"
           }
         },
         "type": "object",
         "required": [
           "count",
-          "archived"
+          "archived",
+          "aggregated"
         ],
         "title": "DataPointsInfo",
-        "description": "Data points information.\n\n``count`` is the live (hot) ``series_sample`` table; ``archived`` is the separate archive\ntable. Both are approximate on a cold cache / from planner statistics."
+        "description": "Data points information.\n\n``count`` is the live (hot) ``series_sample`` table; ``aggregated`` the day and session rows the\nsamples are rolled up into; ``archived`` the legacy archive table until it is dropped. All are\napproximate on a cold cache / from planner statistics."
       },
       "DataSourceListResponse": {
         "properties": {
