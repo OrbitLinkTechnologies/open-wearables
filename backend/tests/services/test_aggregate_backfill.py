@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.integrations import redis_lock
 from app.integrations.celery.tasks.aggregate_backfill_task import bound_statements, run_aggregate_backfill
 from app.integrations.redis_client import get_redis_client
+from app.integrations.rollup_queue import pop_dirty_days, requeue_dirty_days
 from app.models import (
     DataPointSeriesArchive,
     DataSource,
@@ -20,11 +22,13 @@ from app.models import (
     SeriesTypeDefinition,
     WorkoutDetails,
 )
+from app.models.archival_setting import ArchivalSetting
 from app.repositories import AggregateRepository
 from app.repositories.aggregate_backfill_repository import AggregateBackfillRepository
 from app.repositories.archival_repository import DataPointSeriesArchiveRepository
 from app.repositories.data_migration_repository import DataMigrationRepository
 from app.repositories.series_aggregate_repository import LOCAL_DAY
+from app.repositories.series_rollup_repository import SeriesRollupRepository
 from app.schemas.enums import (
     AggregationMethod,
     ComputedBy,
@@ -45,6 +49,19 @@ from tests.factories import (
 AT = datetime(2025, 6, 1, 8, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _archival_settings(db: Session) -> None:
+    """The row the startup seeds; the rollup steps read where retention stopped from it."""
+    db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
+    db.flush()
+
+
+@pytest.fixture
+def roll_up_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The history's rollup, off until a release turns it on."""
+    monkeypatch.setattr("app.services.aggregate_backfill_service.ROLL_UP_HISTORY", True)
+
+
 def _legacy_workout(db: Session, provider: ProviderName, **columns: object) -> WorkoutDetails:
     """A workout saved before the stack: its details have no aggregate rows."""
     workout = EventRecordFactory(category="workout", data_source=DataSourceFactory(provider=provider))
@@ -62,6 +79,20 @@ def _session_rows(db: Session, detail: WorkoutDetails) -> dict[int, EventRecordA
 
 
 class TestBackfillSteps:
+    def test_the_history_is_rolled_up_only_once_a_release_turns_it_on(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        DataPointSeriesFactory(mapping=DataSourceFactory(), recorded_at=AT)
+        ours = db.query(SeriesAggregate).filter(SeriesAggregate.computed_by == ComputedBy.OPEN_WEARABLES)
+
+        assert aggregate_backfill_service.run(db, budget_seconds=60)
+        assert ours.count() == 0
+
+        monkeypatch.setattr("app.services.aggregate_backfill_service.ROLL_UP_HISTORY", True)
+        assert not aggregate_backfill_service.is_done(db)
+        assert aggregate_backfill_service.run(db, budget_seconds=60)
+        assert ours.count() == 1
+
     def test_legacy_suunto_speed_turns_into_metres_per_second_once(self, db: Session) -> None:
         legacy = _legacy_workout(db, ProviderName.SUUNTO, average_speed=Decimal("36"), max_speed=Decimal("72"))
 
@@ -468,6 +499,7 @@ class TestHistoryValues:
 
         assert not db.query(EventRecordAggregate).filter(EventRecordAggregate.computed_by == ComputedBy.PROVIDER).all()
 
+    @pytest.mark.usefixtures("roll_up_history")
     def test_sdk_workout_statistics_land_on_the_workout_they_closed(self, db: Session) -> None:
         source = DataSourceFactory(provider=ProviderName.APPLE)
         workout = EventRecordFactory(data_source=source, start_datetime=AT, duration_seconds=1800)
@@ -478,5 +510,85 @@ class TestHistoryValues:
 
         aggregate_backfill_service.run(db, budget_seconds=60)
 
-        (row,) = db.query(EventRecordAggregate).filter(EventRecordAggregate.record_id == workout.id)
-        assert (row.avg, row.computed_by) == (Decimal("82"), ComputedBy.PROVIDER)
+        rows = {
+            r.computed_by: r
+            for r in db.query(EventRecordAggregate).filter(
+                EventRecordAggregate.record_id == workout.id,
+                EventRecordAggregate.series_type_definition_id == get_series_type_id(SeriesType.cadence),
+            )
+        }
+        assert rows[ComputedBy.PROVIDER].avg == Decimal("82")
+        # Ours, rolled up from the workout's samples, sits beside it: 82 at the end and 90 inside.
+        assert rows[ComputedBy.OPEN_WEARABLES].avg == Decimal("86")
+
+
+@pytest.mark.usefixtures("roll_up_history")
+class TestHistoryRollup:
+    def _ours(self, db: Session) -> list[date]:
+        rows = db.query(LOCAL_DAY).filter(SeriesAggregate.computed_by == ComputedBy.OPEN_WEARABLES)
+        return sorted(day for (day,) in rows)
+
+    def test_every_day_with_samples_gets_our_row_newest_first(self, db: Session) -> None:
+        source = DataSourceFactory()
+        today = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        for days_ago in (1, 45, 400):
+            DataPointSeriesFactory(mapping=source, recorded_at=today - timedelta(days=days_ago), value=Decimal("60"))
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._ours(db) == sorted((today - timedelta(days=n)).date() for n in (1, 45, 400))
+
+    def test_a_chunk_waits_for_a_scheduled_rollup_in_progress(self, db: Session) -> None:
+        """Both write our day rows, so whichever read its samples first must not land last."""
+        DataPointSeriesFactory(mapping=DataSourceFactory(), recorded_at=datetime(2025, 1, 10, 12, tzinfo=timezone.utc))
+        get_redis_client().set("series_rollup:lock", "1")
+
+        assert not aggregate_backfill_service.run(db, budget_seconds=60)
+        assert self._ours(db) == []
+
+        get_redis_client().delete("series_rollup:lock")
+        assert aggregate_backfill_service.run(db, budget_seconds=60)
+        assert self._ours(db) == [date(2025, 1, 10)]
+
+    def test_a_run_rolls_up_the_days_live_writes_queued(self, db: Session) -> None:
+        """Between two chunks the scheduled rollup, trying once every 15 minutes, hardly ever gets the lock."""
+        source = DataSourceFactory()
+        DataPointSeriesFactory(mapping=source, recorded_at=datetime(2025, 1, 10, 12, tzinfo=timezone.utc))
+        requeue_dirty_days([(source.id, date(2025, 1, 10))])
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert pop_dirty_days(10) == []
+
+    def test_a_day_retention_already_emptied_keeps_its_row(self, db: Session) -> None:
+        source = DataSourceFactory()
+        noon = datetime(2025, 1, 10, 12, tzinfo=timezone.utc)
+        samples = [
+            DataPointSeriesFactory(mapping=source, recorded_at=noon + timedelta(minutes=n), value=Decimal(v))
+            for n, v in ((0, "60"), (1, "80"))
+        ]
+        SeriesRollupRepository().roll_up(db, source.id, [date(2025, 1, 10)])
+        for sample in samples:
+            db.delete(sample)
+        DataPointSeriesFactory(mapping=source, recorded_at=noon + timedelta(hours=1), value=Decimal("90"))
+        db.get(ArchivalSetting, 1).deleted_before = date(2025, 2, 1)
+        db.flush()
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        (row,) = db.query(SeriesAggregate).filter(SeriesAggregate.computed_by == ComputedBy.OPEN_WEARABLES)
+        assert row.avg == Decimal("70")
+
+    def test_a_source_left_halfway_goes_on_from_its_last_chunk(self, db: Session) -> None:
+        source = DataSourceFactory()
+        for day in (date(2025, 1, 10), date(2025, 3, 10)):
+            DataPointSeriesFactory(
+                mapping=source, recorded_at=datetime.combine(day, datetime.min.time(), timezone.utc).replace(hour=12)
+            )
+        # A previous run rolled up this source from 2025-03-01 on, then ran out of time.
+        get_redis_client().set("aggregate_backfill:cursor:rollup_all:day", f"{source.id}|2025-03-01")
+        DataMigrationRepository().mark_completed(db, "aggregate_backfill:rollup_recent")
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._ours(db) == [date(2025, 1, 10)]

@@ -11,11 +11,13 @@ from uuid import UUID
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.database import DbSession
+from app.integrations import rollup_queue
 from app.integrations.redis_client import get_redis_client
 from app.repositories.aggregate_backfill_repository import SKIPPED_SOURCE, AggregateBackfillRepository
-from app.repositories.archival_repository import DataPointSeriesArchiveRepository
+from app.repositories.archival_repository import ArchivalSettingRepository, DataPointSeriesArchiveRepository
 from app.repositories.data_migration_repository import DataMigrationRepository
 from app.repositories.local_day import utc_midnight
+from app.repositories.series_rollup_repository import SeriesRollupRepository
 from app.schemas.enums import ProviderName, SeriesType
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
@@ -25,6 +27,11 @@ BACKFILL_MIGRATION = "aggregate_backfill"
 
 # The span the backfill fills before the rest of the history.
 RECENT = timedelta(days=30)
+# Days rolled up per statement and commit: a month of 1 Hz data is a few million rows.
+ROLLUP_CHUNK_DAYS = 31
+# Our day and session rows from the history's samples: off until a release decides to run it; the summaries
+# count those days from the samples meanwhile, and a step added later runs where the others are long done.
+ROLL_UP_HISTORY = False
 
 _CURSOR_KEY = "aggregate_backfill:cursor:{step}"
 _SOURCES_PER_QUERY = 50
@@ -61,6 +68,7 @@ class AggregateBackfillService:
     def __init__(self) -> None:
         self.repo = AggregateBackfillRepository()
         self.samples = DataPointSeriesArchiveRepository()
+        self.rollup_repo = SeriesRollupRepository()
         self.migrations = DataMigrationRepository()
 
     @property
@@ -70,7 +78,9 @@ class AggregateBackfillService:
             BackfillStep("workout_details", self._workout_details),
             # The last month first: those are the days clients look at, so they come back before the rest.
             BackfillStep("history_recent", self._history(RECENT)),
+            *([BackfillStep("rollup_recent", self._rollup(RECENT))] if ROLL_UP_HISTORY else []),
             BackfillStep("history_all", self._history(None)),
+            *([BackfillStep("rollup_all", self._rollup(None))] if ROLL_UP_HISTORY else []),
             BackfillStep("garmin_epoch_windows", self._garmin_epoch_windows),
             BackfillStep("archive_days", self._archive_days),
         ]
@@ -152,6 +162,68 @@ class AggregateBackfillService:
             return self._each_source(db, budget, step, self.repo.history_sources, copy)
 
         return run
+
+    def _rollup(self, period: timedelta | None) -> Callable[[DbSession, Budget], bool]:
+        """Our day and session rows from every source's samples, from the last ``period`` or all, newest days
+        first, ROLLUP_CHUNK_DAYS calendar days at a time; a source left halfway goes on from its last finished
+        chunk."""
+        step = "rollup_recent" if period is not None else "rollup_all"
+        day_key = _CURSOR_KEY.format(step=f"{step}:day")
+
+        def run(db: DbSession, budget: Budget) -> bool:
+            since = (datetime.now(timezone.utc) - period).date() if period is not None else None
+            frozen_before = ArchivalSettingRepository().get(db).deleted_before
+            redis = get_redis_client()
+            self._roll_up_live_days(db)
+
+            def roll_up(source_id: UUID) -> bool:
+                saved = cast(str | None, redis.get(day_key))
+                done_before = (
+                    date.fromisoformat(saved.split("|")[1]) if saved and saved.startswith(f"{source_id}|") else None
+                )
+                first = self.samples.earliest_sample(db, source_id)
+                if first is None:
+                    return True
+                # Every calendar day from the first sample's on: a day without samples costs one index probe, where
+                # listing the days that have some read the source's whole history.
+                start = max(first.date() - timedelta(days=1), since or date.min)
+                end = done_before or _past_today()
+                days = [start + timedelta(days=n) for n in range((end - start).days)]
+                for chunk in _newest_first(days, ROLLUP_CHUNK_DAYS):
+                    # Under the scheduled rollup's lock, a chunk at a time.
+                    if budget.spent() or (token := rollup_queue.take_lock()) is None:
+                        return False
+                    try:
+                        self.rollup_repo.roll_up(db, source_id, chunk, frozen_before)
+                        db.commit()
+                    finally:
+                        rollup_queue.release_lock(token)
+                    redis.set(day_key, f"{source_id}|{min(chunk).isoformat()}")
+                redis.delete(day_key)
+                return True
+
+            return self._each_source(db, budget, step, self.rollup_repo.sources, roll_up)
+
+        return run
+
+    def _roll_up_live_days(self, db: DbSession) -> None:
+        """The days live writes queued, rolled up here: between two chunks the scheduled rollup, trying once every
+        15 minutes, hardly ever finds its lock free."""
+        # Imported here: the archival service imports this module.
+        from app.services.archival_service import archival_service
+
+        token = rollup_queue.take_lock()
+        if token is None:
+            return
+        try:
+            archival_service.roll_up_queued_days(db)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:
+            db.rollback()
+            log_and_capture_error(exc, logger, "Aggregate backfill: the queued days failed; the backfill goes on")
+        finally:
+            rollup_queue.release_lock(token)
 
     def _garmin_epoch_windows(self, db: DbSession, budget: Budget) -> bool:
         # Imported here: the providers package pulls in the Celery tasks, which import this module.
@@ -267,6 +339,11 @@ def _past_today() -> date:
     return datetime.now(timezone.utc).date() + timedelta(days=2)
 
 
+def _newest_first(days: list[date], size: int) -> list[list[date]]:
+    ordered = sorted(days, reverse=True)
+    return [ordered[i : i + size] for i in range(0, len(ordered), size)]
+
+
 def _workout_energy_series() -> dict[ProviderName, SeriesType]:
     """The providers whose workout energy has an established series, as their coverage declares it."""
     # Imported here: the providers package pulls in the Celery tasks, which import this module.
@@ -281,6 +358,14 @@ def _workout_energy_series() -> dict[ProviderName, SeriesType]:
         ProviderName.WHOOP: WHOOP,
         ProviderName.WITHINGS: WITHINGS,
     }
+
+
+def days_from_samples(db: DbSession) -> bool:
+    """Until our rollup is on and has reached the history, readers count the days it has not written from the
+    samples, as they did before it."""
+    if not DataMigrationRepository().is_completed(db, f"{BACKFILL_MIGRATION}:rollup_all"):
+        return True
+    return not ArchivalSettingRepository().get(db).rollup_enabled
 
 
 aggregate_backfill_service = AggregateBackfillService()

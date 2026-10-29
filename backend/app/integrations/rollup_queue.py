@@ -10,6 +10,7 @@ from sqlalchemy import event as sa_event
 
 from app.constants.celery_tasks import CeleryTask
 from app.database import DbSession
+from app.integrations import redis_lock
 from app.integrations.redis_client import get_redis_client
 from app.utils.sentry_helpers import log_and_capture_error
 
@@ -23,6 +24,11 @@ IN_PROGRESS_KEY = "series_rollup:in_progress"
 # archival_settings.deleted_before moves, this is what freezes the days already gone.
 DELETED_BEFORE_KEY = "series_rollup:deleted_before"
 
+# One rollup at a time, whoever runs it: two rolling up the same day would leave whichever read its samples first.
+LOCK_KEY = "series_rollup:lock"
+# Longer than any holder may run, so a killed worker cannot hold the lock for good.
+_LOCK_TTL_SECONDS = 400
+
 # ZPOPMAX and the hand-over to the in-progress set in one step, so a kill between the two cannot lose a day.
 _TAKE = """
 local popped = redis.call('ZPOPMAX', KEYS[1], ARGV[1])
@@ -33,6 +39,15 @@ return taken
 """
 
 logger = getLogger(__name__)
+
+
+def take_lock() -> str | None:
+    """The token that releases the lock, or None while another rollup holds it."""
+    return redis_lock.acquire(LOCK_KEY, _LOCK_TTL_SECONDS)
+
+
+def release_lock(token: str) -> None:
+    redis_lock.release(LOCK_KEY, token)
 
 
 def mark_dirty_days(db_session: DbSession, days: Iterable[tuple[UUID, date]]) -> None:
