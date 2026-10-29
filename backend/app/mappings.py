@@ -38,6 +38,7 @@ numeric_6_3 = Annotated[Decimal, mapped_column(Numeric(6, 3))]
 numeric_10_3 = Annotated[Decimal, mapped_column(Numeric(10, 3))]
 numeric_10_2 = Annotated[Decimal, mapped_column(Numeric(10, 2))]
 numeric_15_5 = Annotated[Decimal, mapped_column(Numeric(15, 5))]
+numeric_unbounded = Annotated[Decimal, mapped_column(Numeric)]
 
 # Custom foreign keys
 FKDeveloper = Annotated[UUID, mapped_column(ForeignKey("developer.id", ondelete="SET NULL"))]
@@ -46,6 +47,10 @@ FKUser = Annotated[UUID, mapped_column(ForeignKey("user.id", ondelete="CASCADE")
 FKEventRecord = Annotated[
     UUID,
     mapped_column(ForeignKey("event_record.id", ondelete="CASCADE"), primary_key=True),
+]
+FKEventRecordRef = Annotated[
+    UUID,
+    mapped_column(ForeignKey("event_record.id", ondelete="CASCADE")),
 ]
 FKDataSource = Annotated[
     UUID,
