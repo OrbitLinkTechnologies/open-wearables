@@ -13,6 +13,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.repositories.aggregate_backfill_repository import SKIPPED_SOURCE, AggregateBackfillRepository
+from app.repositories.archival_repository import DataPointSeriesArchiveRepository
 from app.repositories.data_migration_repository import DataMigrationRepository
 from app.repositories.local_day import utc_midnight
 from app.schemas.enums import ProviderName, SeriesType
@@ -21,6 +22,9 @@ from app.utils.structured_logging import log_structured
 
 # Set once every step is done; retention and the later cleanup wait for it.
 BACKFILL_MIGRATION = "aggregate_backfill"
+
+# The span the backfill fills before the rest of the history.
+RECENT = timedelta(days=30)
 
 _CURSOR_KEY = "aggregate_backfill:cursor:{step}"
 _SOURCES_PER_QUERY = 50
@@ -56,6 +60,7 @@ class AggregateBackfillService:
 
     def __init__(self) -> None:
         self.repo = AggregateBackfillRepository()
+        self.samples = DataPointSeriesArchiveRepository()
         self.migrations = DataMigrationRepository()
 
     @property
@@ -63,6 +68,9 @@ class AggregateBackfillService:
         return [
             BackfillStep("suunto_speed", self._suunto_speed),
             BackfillStep("workout_details", self._workout_details),
+            # The last month first: those are the days clients look at, so they come back before the rest.
+            BackfillStep("history_recent", self._history(RECENT)),
+            BackfillStep("history_all", self._history(None)),
             BackfillStep("garmin_epoch_windows", self._garmin_epoch_windows),
             BackfillStep("archive_days", self._archive_days),
         ]
@@ -123,6 +131,27 @@ class AggregateBackfillService:
             return self._each_window(db, budget, "workout_details", source_id, first, window)
 
         return self._each_source(db, budget, "workout_details", self.repo.sources_with_workouts, mirror)
+
+    def _history(self, period: timedelta | None) -> Callable[[DbSession, Budget], bool]:
+        """Day and session values stored as samples before the aggregate tables, from the last ``period`` or all."""
+
+        step = "history_recent" if period is not None else "history_all"
+
+        def run(db: DbSession, budget: Budget) -> bool:
+            def copy(source: tuple[UUID, str]) -> bool:
+                source_id, provider = source
+                first = self.samples.earliest_sample(db, source_id)
+                if first is not None and period is not None:
+                    first = max(first, datetime.now(timezone.utc) - period)
+
+                def window(lo: datetime, hi: datetime) -> None:
+                    self.repo.copy_history_values(db, source_id, provider, lo.date(), hi.date())
+
+                return self._each_window(db, budget, step, source_id, first, window)
+
+            return self._each_source(db, budget, step, self.repo.history_sources, copy)
+
+        return run
 
     def _garmin_epoch_windows(self, db: DbSession, budget: Budget) -> bool:
         # Imported here: the providers package pulls in the Celery tasks, which import this module.
