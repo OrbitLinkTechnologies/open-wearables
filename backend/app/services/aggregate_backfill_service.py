@@ -22,7 +22,7 @@ from app.schemas.enums import ProviderName, SeriesType
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
-# Set once every step is done; retention and the later cleanup wait for it.
+# Set once every step is done; retention waits for it.
 BACKFILL_MIGRATION = "aggregate_backfill"
 
 # The span the backfill fills before the rest of the history.

@@ -19,6 +19,7 @@ from app.models import (
     EventRecordAggregate,
     SeriesAggregate,
     SeriesSample,
+    SeriesSampleBackup,
     SeriesTypeDefinition,
     WorkoutDetails,
 )
@@ -518,8 +519,8 @@ class TestHistoryValues:
             )
         }
         assert rows[ComputedBy.PROVIDER].avg == Decimal("82")
-        # Ours, rolled up from the workout's samples, sits beside it: 82 at the end and 90 inside.
-        assert rows[ComputedBy.OPEN_WEARABLES].avg == Decimal("86")
+        # Ours sits beside it, rolled up again once the copy at the end was deleted: the 90 inside.
+        assert rows[ComputedBy.OPEN_WEARABLES].avg == Decimal("90")
 
 
 @pytest.mark.usefixtures("roll_up_history")
@@ -592,3 +593,135 @@ class TestHistoryRollup:
         aggregate_backfill_service.run(db, budget_seconds=60)
 
         assert self._ours(db) == [date(2025, 1, 10)]
+
+
+@pytest.mark.usefixtures("roll_up_history")
+class TestHistoryValuesMovedToTheBackup:
+    """The copied samples move to series_sample_backup; our rows count readings only, as on an instance that never
+    stored day values as samples."""
+
+    def _ours(self, db: Session, series_type: SeriesType) -> list[tuple[date, Decimal | None, Decimal | None]]:
+        rows = db.query(SeriesAggregate, LOCAL_DAY).filter(
+            SeriesAggregate.computed_by == ComputedBy.OPEN_WEARABLES,
+            SeriesAggregate.series_type_definition_id == get_series_type_id(series_type),
+        )
+        return sorted((day, row.sum, row.avg) for row, day in rows)
+
+    def _values(self, db: Session, model: type[SeriesSample] | type[SeriesSampleBackup]) -> list[Decimal]:
+        return sorted(row.value for row in db.query(model))
+
+    def test_the_copy_moves_what_it_matched_and_nothing_else(self, db: Session) -> None:
+        polar = DataSourceFactory(provider=ProviderName.POLAR)
+        hrv = SeriesType.heart_rate_variability_rmssd
+        _sample(db, polar, hrv, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
+        _sample(db, polar, hrv, datetime(2025, 6, 2, 12, tzinfo=timezone.utc), "70")
+        apple = DataSourceFactory(provider=ProviderName.APPLE)
+        workout = EventRecordFactory(data_source=apple, start_datetime=AT, duration_seconds=1800)
+        _sample(db, apple, SeriesType.steps, workout.end_datetime, "500")
+        _sample(db, apple, SeriesType.steps, AT + timedelta(minutes=10), "1000")
+        xml = DataSourceFactory(provider=ProviderName.APPLE, source="apple_health_xml")
+        xml_workout = EventRecordFactory(data_source=xml, start_datetime=AT, duration_seconds=1800)
+        _sample(db, xml, SeriesType.vo2_max, xml_workout.end_datetime, "41")
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._values(db, SeriesSample) == [Decimal("41"), Decimal("70"), Decimal("1000")]
+        assert self._values(db, SeriesSampleBackup) == [Decimal("61"), Decimal("500")]
+
+    def test_a_moved_sample_keeps_its_row(self, db: Session) -> None:
+        source = DataSourceFactory(provider=ProviderName.POLAR)
+        at = datetime(2025, 6, 2, tzinfo=timezone.utc)
+        _sample(db, source, SeriesType.heart_rate_variability_rmssd, at, "61", external_id="night-1")
+        (sample,) = db.query(SeriesSample)
+        before = (sample.id, sample.external_id, sample.recorded_at, sample.zone_offset, sample.created_at)
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        (moved,) = db.query(SeriesSampleBackup)
+        assert (moved.id, moved.external_id, moved.recorded_at, moved.zone_offset, moved.created_at) == before
+        assert (moved.data_source_id, moved.value) == (source.id, Decimal("61"))
+
+    def test_a_day_value_leaves_the_samples_and_our_day(self, db: Session) -> None:
+        source = DataSourceFactory(provider=ProviderName.POLAR)
+        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
+        _sample(
+            db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, 12, tzinfo=timezone.utc), "70"
+        )
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert db.query(SeriesSample).count() == 1
+        assert self._ours(db, SeriesType.heart_rate_variability_rmssd) == [(date(2025, 6, 2), None, Decimal("70"))]
+
+    def test_a_day_value_past_the_windows_edge_is_left_for_the_next_window(self, db: Session) -> None:
+        """A window reads two days past its edges to find its days; it moves its own days only, or the next window
+        would find nothing to copy."""
+        source = DataSourceFactory(provider=ProviderName.POLAR)
+        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
+        repo = AggregateBackfillRepository()
+
+        repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 5, 1), date(2025, 6, 2))
+        kept = self._values(db, SeriesSample)
+        repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 6, 2), date(2025, 7, 1))
+
+        assert kept == [Decimal("61")]
+        assert self._values(db, SeriesSampleBackup) == [Decimal("61")]
+        assert _days(db) == [("heart_rate_variability_rmssd", date(2025, 6, 2), "+00:00", None, Decimal("61"))]
+
+    def test_a_window_copied_again_moves_nothing_twice(self, db: Session) -> None:
+        source = DataSourceFactory(provider=ProviderName.POLAR)
+        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
+        repo = AggregateBackfillRepository()
+
+        first = repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 6, 1), date(2025, 7, 1))
+        again = repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 6, 1), date(2025, 7, 1))
+
+        assert (first, again) == (1, 0)
+        assert (db.query(SeriesSample).count(), db.query(SeriesSampleBackup).count()) == (0, 1)
+
+    def test_a_deleted_data_source_takes_its_backup_with_it(self, db: Session) -> None:
+        source = DataSourceFactory(provider=ProviderName.POLAR)
+        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        db.execute(text("DELETE FROM data_source WHERE id = :id"), {"id": source.id})
+
+        assert db.query(SeriesSampleBackup).count() == 0
+
+    def test_garmins_nightly_hrv_off_midnight_is_left_out_too(self, db: Session) -> None:
+        source = DataSourceFactory(provider=ProviderName.GARMIN)
+        bedtime = datetime(2025, 6, 1, 21, tzinfo=timezone.utc)
+        hrv = SeriesType.heart_rate_variability_rmssd
+        _sample(db, source, hrv, bedtime, "84", zone_offset="+02:00", external_id="hrv-1")
+        _sample(db, source, hrv, bedtime + timedelta(hours=3), "50", zone_offset="+02:00", external_id="hrv-1:300")
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._ours(db, hrv) == [(date(2025, 6, 2), None, Decimal("50"))]
+
+    def test_a_workout_statistic_counts_in_neither_our_day_nor_our_session(self, db: Session) -> None:
+        source = DataSourceFactory(provider=ProviderName.APPLE)
+        workout = EventRecordFactory(data_source=source, start_datetime=AT, duration_seconds=1800)
+        _sample(db, source, SeriesType.steps, workout.end_datetime, "500")
+        _sample(db, source, SeriesType.physical_effort, workout.end_datetime, "7")
+        _sample(db, source, SeriesType.steps, AT + timedelta(minutes=10), "1000", external_id="hk-uuid")
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._ours(db, SeriesType.steps) == [(AT.date(), Decimal("1000"), Decimal("1000"))]
+        assert self._ours(db, SeriesType.physical_effort) == []
+        (session,) = db.query(EventRecordAggregate).filter(
+            EventRecordAggregate.record_id == workout.id,
+            EventRecordAggregate.computed_by == ComputedBy.OPEN_WEARABLES,
+            EventRecordAggregate.series_type_definition_id == get_series_type_id(SeriesType.steps),
+        )
+        assert session.sum == Decimal("1000")
+
+    def test_a_session_value_without_its_session_stays_a_reading(self, db: Session) -> None:
+        """The history could not copy it onto a sleep, so it is left where it was."""
+        source = DataSourceFactory(provider=ProviderName.OURA)
+        _sample(db, source, SeriesType.respiratory_rate, datetime(2025, 6, 2, 3, tzinfo=timezone.utc), "14")
+
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        assert self._ours(db, SeriesType.respiratory_rate) == [(date(2025, 6, 2), None, Decimal("14"))]
