@@ -16,9 +16,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, DataSource
+from app.models import DataSource, SeriesSample
 from app.repositories.data_point_series_repository import DataPointSeriesRepository, TypeCounts, WriteCounts
-from app.schemas.enums import SeriesType
+from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import TimeSeriesQueryParams, TimeSeriesSampleCreate
 from tests.factories import DataSourceFactory, UserFactory
 
@@ -29,7 +29,7 @@ class TestDataPointSeriesRepository:
     @pytest.fixture
     def series_repo(self) -> DataPointSeriesRepository:
         """Create DataPointSeriesRepository instance."""
-        return DataPointSeriesRepository(DataPointSeries)
+        return DataPointSeriesRepository(SeriesSample)
 
     def test_create_with_existing_mapping(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         """Test creating a data point with an existing external mapping."""
@@ -730,14 +730,14 @@ class TestDataPointSeriesRepository:
         # Act
         series_repo.bulk_create(db, [sample])
         db.commit()
-        row_id = db.query(DataPointSeries.id).filter(DataPointSeries.recorded_at == ts).one()[0]
-        xmin_before = db.execute(text("SELECT xmin FROM data_point_series WHERE id = :id"), {"id": row_id}).scalar()
+        row_id = db.query(SeriesSample.id).filter(SeriesSample.recorded_at == ts).one()[0]
+        xmin_before = db.execute(text("SELECT xmin FROM series_sample WHERE id = :id"), {"id": row_id}).scalar()
 
         # Re-send the exact same row: same value, same everything -> conflicts, but
         # nothing actually differs.
         counts = series_repo.bulk_create(db, [sample])
         db.commit()
-        xmin_after = db.execute(text("SELECT xmin FROM data_point_series WHERE id = :id"), {"id": row_id}).scalar()
+        xmin_after = db.execute(text("SELECT xmin FROM series_sample WHERE id = :id"), {"id": row_id}).scalar()
 
         # Assert
         assert counts.updated == 1  # still reported as a conflict, per WriteCounts' contract
@@ -770,7 +770,7 @@ class TestDataPointSeriesRepository:
         db.commit()
 
         # Assert
-        stored = db.query(DataPointSeries.value).filter(DataPointSeries.recorded_at == ts).scalar()
+        stored = db.query(SeriesSample.value).filter(SeriesSample.recorded_at == ts).scalar()
         assert stored == 2000
 
     def test_bulk_create_null_fields_round_trip_through_copy(
@@ -800,11 +800,45 @@ class TestDataPointSeriesRepository:
         db.commit()
 
         # Assert
-        stored = db.query(DataPointSeries).filter(DataPointSeries.id == sample.id).one()
+        stored = db.query(SeriesSample).filter(SeriesSample.id == sample.id).one()
         assert stored.external_id is None
         assert stored.zone_offset is None
         assert stored.is_daily_total is None
         assert stored.value == Decimal("1.5")
+
+    def test_bulk_create_keeps_seven_places_past_the_old_column(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """Coordinates keep ~1 cm, a value past NUMERIC(10, 3) is stored, float noise is cut at seven places."""
+        # Arrange
+        user = UserFactory()
+        ts = datetime(2099, 1, 4, tzinfo=timezone.utc)
+        values = {
+            SeriesType.latitude: (52.229676, Decimal("52.229676")),
+            SeriesType.longitude: (-21.0122287, Decimal("-21.0122287")),
+            SeriesType.distance_walking_running: (20_412_345.5, Decimal("20412345.5")),
+            SeriesType.elevation: (0.1 + 0.2, Decimal("0.3")),
+        }
+        samples = [
+            TimeSeriesSampleCreate(
+                id=uuid4(), user_id=user.id, source="garmin", recorded_at=ts, value=value, series_type=series_type
+            )
+            for series_type, (value, _) in values.items()
+        ]
+
+        # Act
+        series_repo.bulk_create(db, samples)
+        db.commit()
+
+        # Assert
+        stored = dict(
+            db.query(SeriesSample.series_type_definition_id, SeriesSample.value).filter(
+                SeriesSample.id.in_([s.id for s in samples])
+            )
+        )
+        assert {series_type: stored[get_series_type_id(series_type)] for series_type in values} == {
+            series_type: expected for series_type, (_, expected) in values.items()
+        }
 
     # ------------------------------------------------------------------
     # get_daily_activity_aggregates — prefer-daily-total-else-sum logic
@@ -909,7 +943,7 @@ class TestPerTypeWriteCounts:
 
     @pytest.fixture
     def series_repo(self) -> DataPointSeriesRepository:
-        return DataPointSeriesRepository(DataPointSeries)
+        return DataPointSeriesRepository(SeriesSample)
 
     @staticmethod
     def _sample(user_id: UUID, recorded_at: datetime, series_type: SeriesType) -> TimeSeriesSampleCreate:

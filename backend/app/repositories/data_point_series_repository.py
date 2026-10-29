@@ -37,7 +37,8 @@ from sqlalchemy.orm import Query
 from sqlalchemy.schema import CreateTable
 
 from app.database import DbSession
-from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, DeviceTypePriority, ProviderPriority
+from app.mappings import SERIES_VALUE_SCALE
+from app.models import DataPointSeriesArchive, DataSource, DeviceTypePriority, ProviderPriority, SeriesSample
 from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSourceIdentity, DataSourceRepository
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
@@ -233,16 +234,16 @@ class AggregatedSample(NamedTuple):
 
 
 class DataPointSeriesRepository(
-    CrudRepository[DataPointSeries, TimeSeriesSampleCreate, TimeSeriesSampleUpdate],
+    CrudRepository[SeriesSample, TimeSeriesSampleCreate, TimeSeriesSampleUpdate],
 ):
     """Repository for unified device data point series."""
 
-    def __init__(self, model: type[DataPointSeries]):
+    def __init__(self, model: type[SeriesSample]):
         super().__init__(model)
         self.data_source_repo = DataSourceRepository()
 
     @handle_exceptions
-    def create(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> DataPointSeries:
+    def create(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> SeriesSample:
         """Create a data point sample, or return existing if duplicate.
 
         Handles duplicate records gracefully by catching IntegrityError and
@@ -255,6 +256,7 @@ class DataPointSeriesRepository(
         # Set the proper values
         creation_data["data_source_id"] = data_source.id
         creation_data["series_type_definition_id"] = get_series_type_id(creator.series_type)
+        creation_data["value"] = round(creator.value, SERIES_VALUE_SCALE)
 
         creation = self.model(**creation_data)
         db_session.add(creation)
@@ -302,7 +304,7 @@ class DataPointSeriesRepository(
         return counts
 
     class _StagingRow(NamedTuple):
-        """One row as loaded into data_point_series_staging via COPY, in column order."""
+        """One row as loaded into series_sample_staging via COPY, in column order."""
 
         id: UUID
         external_id: str | None
@@ -337,7 +339,7 @@ class DataPointSeriesRepository(
                     data_source_id=source_id,
                     recorded_at=creator.recorded_at,
                     zone_offset=creator.zone_offset,
-                    value=creator.value,
+                    value=round(creator.value, SERIES_VALUE_SCALE),
                     series_type_definition_id=get_series_type_id(creator.series_type),
                     is_daily_total=creator.is_daily_total,
                 )
@@ -366,9 +368,9 @@ class DataPointSeriesRepository(
         assert raw_conn is not None, "no DBAPI connection on an active Session"
         with raw_conn.cursor() as cursor:
             # Create the temporary staging table for bulk-importing data points.
-            model_columns = DataPointSeries.__table__.c
+            model_columns = SeriesSample.__table__.c
             staging_table = Table(
-                "data_point_series_staging",
+                "series_sample_staging",
                 MetaData(),
                 *(Column(name, model_columns[name].type) for name in self._StagingRow._fields),
                 prefixes=["TEMPORARY"],
@@ -376,19 +378,19 @@ class DataPointSeriesRepository(
             )
             staging_ddl = str(CreateTable(staging_table, if_not_exists=True).compile(dialect=postgresql.dialect()))
             cursor.execute(typing_cast(LiteralString, staging_ddl))
-            cursor.execute("TRUNCATE data_point_series_staging")
+            cursor.execute("TRUNCATE series_sample_staging")
             # Raw psycopg connection sharing this Session's transaction - COPY has no
             # SQLAlchemy Core equivalent, and using a separate connection would commit
             # outside this transaction.
-            with cursor.copy(f"COPY data_point_series_staging ({self._COPY_COLUMNS_SQL}) FROM STDIN") as copy:
+            with cursor.copy(f"COPY series_sample_staging ({self._COPY_COLUMNS_SQL}) FROM STDIN") as copy:
                 for row in rows:
                     copy.write_row(row)
 
             cursor.execute(
                 f"""
                     WITH merged AS (
-                        INSERT INTO data_point_series ({self._COPY_COLUMNS_SQL})
-                        SELECT {self._COPY_COLUMNS_SQL} FROM data_point_series_staging
+                        INSERT INTO series_sample ({self._COPY_COLUMNS_SQL})
+                        SELECT {self._COPY_COLUMNS_SQL} FROM series_sample_staging
                         ORDER BY data_source_id, series_type_definition_id, recorded_at
                         ON CONFLICT (data_source_id, series_type_definition_id, recorded_at)
                         DO UPDATE SET
@@ -396,10 +398,10 @@ class DataPointSeriesRepository(
                             value = excluded.value,
                             zone_offset = excluded.zone_offset,
                             is_daily_total = excluded.is_daily_total
-                        WHERE data_point_series.value IS DISTINCT FROM excluded.value
-                           OR data_point_series.external_id IS DISTINCT FROM excluded.external_id
-                           OR data_point_series.zone_offset IS DISTINCT FROM excluded.zone_offset
-                           OR data_point_series.is_daily_total IS DISTINCT FROM excluded.is_daily_total
+                        WHERE series_sample.value IS DISTINCT FROM excluded.value
+                           OR series_sample.external_id IS DISTINCT FROM excluded.external_id
+                           OR series_sample.zone_offset IS DISTINCT FROM excluded.zone_offset
+                           OR series_sample.is_daily_total IS DISTINCT FROM excluded.is_daily_total
                         RETURNING (xmax = 0) AS was_insert, series_type_definition_id
                     )
                     SELECT series_type_definition_id, count(*) FILTER (WHERE was_insert) AS inserted
@@ -427,7 +429,7 @@ class DataPointSeriesRepository(
         inserted = sum(inserted_by_type_id.values())
         return WriteCounts(inserted, len(rows) - inserted, by_type)
 
-    def try_commit(self, db_session: DbSession, creation: DataPointSeries) -> DataPointSeries:
+    def try_commit(self, db_session: DbSession, creation: SeriesSample) -> SeriesSample:
         try:
             db_session.commit()
             db_session.refresh(creation)
@@ -459,7 +461,7 @@ class DataPointSeriesRepository(
         types: list[SeriesType],
         user_id: UUID,
         source_by_type: dict[int, UUID] | None = None,
-    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int | None]:
+    ) -> tuple[list[tuple[SeriesSample, DataSource]], int | None]:
         """Get data points with filtering and keyset pagination.
 
         Returns (samples, total_count). The count is a full aggregate over the largest table in
@@ -920,7 +922,7 @@ class DataPointSeriesRepository(
     ) -> dict[UUID, int]:
         """Batch-compute average HR from series data for multiple workout windows.
 
-        One query per chunk of workouts, a VALUES CTE joined against data_point_series with one
+        One query per chunk of workouts, a VALUES CTE joined against series_sample with one
         index range scan per (workout, source). HR from the workout's own source wins; the fallback
         sources are used only when it has none in the window.
 
@@ -969,7 +971,7 @@ class DataPointSeriesRepository(
             )
             SELECT ww.record_id, ww.is_own, ROUND(AVG(dps.value))::int
             FROM workout_windows ww
-            JOIN data_point_series dps
+            JOIN series_sample dps
                 ON dps.data_source_id = ww.data_source_id
                 AND dps.series_type_definition_id = :hr_type_id
                 AND dps.recorded_at >= ww.start_time
