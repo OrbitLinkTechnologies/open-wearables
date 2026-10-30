@@ -109,7 +109,7 @@ services:
 
   cloudflared-ow:
     image: cloudflare/cloudflared:latest
-    namme: ow_cloudflare_tunnel
+    container_name: ow_cloudflare_tunnel
     profiles: ["cloudflare-tunnel"]
     restart: unless-stopped
     command: tunnel run
