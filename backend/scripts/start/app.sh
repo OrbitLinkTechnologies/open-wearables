@@ -126,6 +126,13 @@ echo 'Running SDK unreported sleep stages cleanup...'
 uv run python scripts/data_migrations/clear_sdk_unreported_sleep_stages.py \
     || echo "Warning: SDK sleep stages cleanup failed — will retry on next startup."
 
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Removes the stage and time-in-bed copies that Polar sleep re-syncs appended, and keys the
+# nights by date so later re-syncs replace them. Runs once per instance (data_migration).
+echo 'Running Polar sleep dedupe...'
+uv run python scripts/data_migrations/dedupe_polar_sleep.py \
+    || echo "Warning: Polar sleep dedupe failed — will retry on next startup."
+
 # Initialize archival settings
 echo 'Initializing archival settings...'
 uv run python scripts/init/seed_archival_settings.py

@@ -246,11 +246,11 @@ class Polar247Data(Base247DataTemplate):
         for raw in raw_items:
             if (parsed := self._parse(raw, SleepJSON, user_id, "sleep")) is None:
                 continue
-            if not parsed.sleep_start_time or not parsed.sleep_end_time:
+            if not parsed.date or not parsed.sleep_start_time or not parsed.sleep_end_time:
                 log_structured(
                     self.logger,
                     "warning",
-                    f"Polar sleep record missing start/end time: {parsed.date}",
+                    f"Polar sleep record missing date or start/end time: {parsed.date}",
                     provider="polar",
                     user_id=str(user_id),
                 )
@@ -276,6 +276,7 @@ class Polar247Data(Base247DataTemplate):
                 duration_seconds=duration_seconds,
                 start_datetime=start_dt,
                 end_datetime=end_dt,
+                external_id=f"sleep-{parsed.date}",
                 provider=ProviderName.POLAR,
                 user_id=user_id,
             )
@@ -937,6 +938,19 @@ class Polar247Data(Base247DataTemplate):
     # Persistence helpers
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _claim_night_stored_without_id(db: DbSession, user_id: UUID, record: EventRecordCreate) -> None:
+        """Give the record's id to the Polar night stored without one that it overlaps, so the save replaces it.
+
+        Polar keeps one sleep per date, so an overlapping night is this one, moved or not. Nights stored before
+        Polar sleep carried an id, by an old pod during a deploy, or without stages by dedupe_polar_sleep have none.
+        """
+        stored = event_record_service.find_adjacent_sleep_record(
+            db, user_id, record.start_datetime, record.end_datetime, 0, source=record.source, provider=record.provider
+        )
+        if stored is not None and stored.external_id is None:
+            stored.external_id = record.external_id
+
     def _save_timeseries(self, db: DbSession, samples: list[TimeSeriesSampleCreate]) -> WriteCounts:
         counts = WriteCounts(0, 0)
         if samples:
@@ -965,12 +979,13 @@ class Polar247Data(Base247DataTemplate):
             case PolarWebhookEventType.SLEEP:
                 count = 0
                 for record, detail, score, hr_samples in self.normalize_sleep([raw], user_id):
-                    event_record_service.create_or_merge_sleep(
+                    self._claim_night_stored_without_id(db, user_id, record)
+                    stored = event_record_service.create_or_merge_sleep(
                         db, user_id, record, detail, settings.sleep_end_gap_minutes
                     )
                     count += 1
                     if score:
-                        health_score_service.bulk_create(db, [score])
+                        health_score_service.bulk_create(db, [score.model_copy(update={"event_record_id": stored.id})])
                     if hr_samples:
                         timeseries_service.bulk_create_samples(db, hr_samples)
                 return {"sleep": count}
@@ -1030,10 +1045,14 @@ class Polar247Data(Base247DataTemplate):
 
         for record, detail, score, hr in normalized:
             try:
-                event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
+                self._claim_night_stored_without_id(db, user_id, record)
+                stored = event_record_service.create_or_merge_sleep(
+                    db, user_id, record, detail, settings.sleep_end_gap_minutes
+                )
                 count += 1
+                # A re-sync keeps the stored night, not the id normalize_sleep drew for it
                 if score:
-                    scores.append(score)
+                    scores.append(score.model_copy(update={"event_record_id": stored.id}))
                 hr_samples.extend(hr)
             except Exception as e:
                 log_and_capture_error(
